@@ -1,0 +1,389 @@
+// Use the Parola library for Matrix
+
+#include <ESP8266WiFi.h>
+#include <MD_Parola.h>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+#include "FS.h"
+
+// Turn on debug statements to the serial output
+#define  DEBUG  0
+
+#if  DEBUG
+#define PRINT(s, x) { Serial.print(F(s)); Serial.print(x); }
+#define PRINTS(x) Serial.print(F(x))
+#define PRINTX(x) Serial.println(x, HEX)
+#else
+#define PRINT(s, x)
+#define PRINTS(x)
+#define PRINTX(x)
+#endif
+
+// Define the number of devices we have in the chain and the hardware interface
+// NOTE: These pin numbers are for ESO8266 hardware SPI and will probably not
+// work with your hardware and may need to be adapted
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES 4
+
+//For Matrix
+#define CLK_PIN   14 
+#define DATA_PIN  13 
+#define CS_PIN   15
+
+//For LED
+const int dataPin = 5;
+const int loadPin = 12;
+const int clockPin = 4;
+
+MD_Parola P = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
+
+// WiFi login parameters - network name and password
+const char* ssid = "<Wifi_SSID>"; //Change SSID of your Wifi
+const char* password = "<Wifi_Password>"; //Change Password of your wifi
+
+// WiFi Server object and parameters
+WiFiServer server(80);
+
+// Scrolling parameters
+uint8_t frameDelay = 25;  // default frame delay value
+textEffect_t  scrollEffect = PA_SCROLL_LEFT;
+
+// Global message buffers shared by Wifi and Scrolling functions
+#define BUF_SIZE  512
+char curMessage[BUF_SIZE];
+char newMessage[BUF_SIZE];
+bool newMessageAvailable = false;
+int Transaction=0;
+bool newtransaction=false;
+
+const char WebResponse[] = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n";
+
+const char WebPage[] =
+  "<!DOCTYPE html>" \
+  "<html>" \
+  "<head>" \
+  "<title>RPA Display - Santan Barnwal</title>" \
+
+  "<script>" \
+  "strLine = \"\";" \
+
+  "function SendData()" \
+  "{" \
+  "  nocache = \"/&nocache=\" + Math.random() * 1000000;" \
+  "  var request = new XMLHttpRequest();" \
+  "  strLine = \"&MSG=\" + document.getElementById(\"data_form\").Message.value;" \
+  "  strLine = strLine + \"/&TR=\" + document.getElementById(\"data_form\").Transaction.value;" \
+  "  request.open(\"GET\", strLine + nocache, false);" \
+  "  request.send(null);" \
+  "}" \
+  "</script>" \
+  "</head>" \
+
+  "<body>" \
+  "<p><b>MD_Parola set message</b></p>" \
+
+  "<form id=\"data_form\" name=\"frmText\">" \
+  "<label>Message:<br><input type=\"text\" name=\"Message\" maxlength=\"255\"></label>" \
+  "<label>Transaction:<br><input type=\"text\" name=\"Transaction\" maxlength=\"2\"></label>" \
+  "<br><br>" \
+  "</form>" \
+  "<br>" \
+  "<input type=\"submit\" value=\"Send Data\" onclick=\"SendData()\">" \
+  "</body>" \
+  "</html>";
+
+const char *err2Str(wl_status_t code)
+{
+  switch (code)
+  {
+    case WL_IDLE_STATUS:    return ("IDLE");           break; // WiFi is in process of changing between statuses
+    case WL_NO_SSID_AVAIL:  return ("NO_SSID_AVAIL");  break; // case configured SSID cannot be reached
+    case WL_CONNECTED:      return ("CONNECTED");      break; // successful connection is established
+    case WL_CONNECT_FAILED: return ("CONNECT_FAILED"); break; // password is incorrect
+    case WL_DISCONNECTED:   return ("CONNECT_FAILED"); break; // module is not configured in station mode
+    default: return ("??");
+  }
+}
+
+uint8_t htoi(char c)
+{
+  c = toupper(c);
+  if ((c >= '0') && (c <= '9')) return (c - '0');
+  if ((c >= 'A') && (c <= 'F')) return (c - 'A' + 0xa);
+  return (0);
+}
+
+void getData(char *szMesg, uint16_t len)
+// Message may contain data for:
+// New text (/&MSG=)
+// Scroll direction (/&TR=)
+{
+  char *pStart, *pEnd;      // pointer to start and end of text
+
+  // check text message
+  pStart = strstr(szMesg, "/&MSG=");
+  if (pStart != NULL)
+  {
+    char *psz = newMessage;
+
+    pStart += 6;  // skip to start of data
+    pEnd = strstr(pStart, "/&");
+
+    if (pEnd != NULL)
+    {
+      while (pStart != pEnd)
+      {
+        if ((*pStart == '%') && isdigit(*(pStart + 1)))
+        {
+          // replace %xx hex code with the ASCII character
+          char c = 0;
+          pStart++;
+          c += (htoi(*pStart++) << 4);
+          c += htoi(*pStart++);
+          *psz++ = c;
+        }
+        else
+          *psz++ = *pStart++;
+      }
+
+      *psz = '\0'; // terminate the string
+      newMessageAvailable = (strlen(newMessage) != 0);
+      PRINT("\nNew Msg: ", newMessage);
+    }
+  }
+
+  
+  // check Transaction
+  pStart = strstr(szMesg, "/&TR=");
+  if (pStart != NULL)
+  {
+    pStart += 5;  // skip to start of data
+    Transaction = atoi(pStart);
+    //PRINT("Transaction Status: ", Transaction);
+    Serial.println("Transaction : "+Transaction);
+    newtransaction=true;
+  }
+}
+
+
+void handleWiFi(void)
+{
+  static enum { S_IDLE, S_WAIT_CONN, S_READ, S_EXTRACT, S_RESPONSE, S_DISCONN } state = S_IDLE;
+  static char szBuf[1024];
+  static uint16_t idxBuf = 0;
+  static WiFiClient client;
+  static uint32_t timeStart;
+
+  switch (state)
+  {
+    case S_IDLE:   // initialise
+      PRINTS("\nS_IDLE");
+      idxBuf = 0;
+      state = S_WAIT_CONN;
+      break;
+
+    case S_WAIT_CONN:   // waiting for connection
+      {
+        client = server.available();
+        if (!client) break;
+        if (!client.connected()) break;
+
+#if DEBUG
+        char szTxt[20];
+        sprintf(szTxt, "%03d:%03d:%03d:%03d", client.remoteIP()[0], client.remoteIP()[1], client.remoteIP()[2], client.remoteIP()[3]);
+        PRINT("\nNew client @ ", szTxt);
+#endif
+
+        timeStart = millis();
+        state = S_READ;
+      }
+      break;
+
+    case S_READ: // get the first line of data
+      PRINTS("\nS_READ ");
+
+      while (client.available())
+      {
+        char c = client.read();
+
+        if ((c == '\r') || (c == '\n'))
+        {
+          szBuf[idxBuf] = '\0';
+          client.flush();
+          PRINT("\nRecv: ", szBuf);
+          state = S_EXTRACT;
+        }
+        else
+          szBuf[idxBuf++] = (char)c;
+      }
+      if (millis() - timeStart > 1000)
+      {
+        PRINTS("\nWait timeout");
+        state = S_DISCONN;
+      }
+      break;
+
+    case S_EXTRACT: // extract data
+      PRINTS("\nS_EXTRACT");
+      // Extract the string from the message if there is one
+      getData(szBuf, BUF_SIZE);
+      state = S_RESPONSE;
+      break;
+
+    case S_RESPONSE: // send the response to the client
+      PRINTS("\nS_RESPONSE");
+      // Return the response to the client (web page)
+      client.print(WebResponse);
+      client.print(WebPage);
+      state = S_DISCONN;
+      break;
+
+    case S_DISCONN: // disconnect client
+      PRINTS("\nS_DISCONN");
+      client.flush();
+      client.stop();
+      state = S_IDLE;
+      break;
+
+    default:  state = S_IDLE;
+  }
+}
+
+void setup()
+{
+  Serial.begin(9600);
+
+pinMode(dataPin, OUTPUT);
+pinMode(loadPin, OUTPUT);
+pinMode(clockPin, OUTPUT);
+
+  digitalWrite(loadPin, LOW);
+  shiftOut(dataPin, clockPin, LSBFIRST, 0xFFFF);
+  shiftOut(dataPin, clockPin, LSBFIRST, 0xFFFF>>8);
+  digitalWrite(loadPin, HIGH);
+
+
+  PRINTS("\n[MD_Parola WiFi Message Display]\nType a message for the scrolling display from your internet browser");
+  String msg = "";
+  bool result = SPIFFS.begin();
+  File f = SPIFFS.open("/f.txt", "r");
+  if (!f) {
+    // open the file in write mode
+    File f = SPIFFS.open("/f.txt", "w");
+    f.println("Santan Barnwal");
+  } else {
+    // we could open the file
+    while (f.available()) {
+      //Lets read line by line from the file
+      msg = f.readStringUntil('\n');
+      Serial.println(msg);
+    }
+
+  }
+  f.close();
+  //curMessage=msg.toCharArray(BUF_SIZE,msg.length() + 1);
+
+  P.begin();
+  P.displayClear();
+  P.displaySuspend(false);
+
+  P.displayText(curMessage, PA_CENTER, 20, 30, PA_NO_EFFECT, PA_NO_EFFECT);
+
+  curMessage[0] = newMessage[0] = '\0';
+
+  // Connect to and initialise WiFi network
+  PRINT("\nConnecting to ", ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    PRINT("\n", err2Str(WiFi.status()));
+    delay(500);
+  }
+  PRINTS("\nWiFi connected");
+
+  // Start the server
+  server.begin();
+  PRINTS("\nServer started");
+  
+  msg.toCharArray(curMessage, msg.length());
+  PRINT("\nAssigned IP ", curMessage);  
+}
+
+void loop()
+{
+  handleWiFi();
+
+  if (P.displayAnimate())
+  {
+    if (newMessageAvailable)
+    {
+      strcpy(curMessage, newMessage);
+      File f = SPIFFS.open("/f.txt", "w");
+      f.println(newMessage);
+      f.close();
+      Serial.println(newMessageAvailable);
+      newMessageAvailable = false;
+      //trandisplay();
+    }
+    P.displayReset();
+    
+  }
+
+  if(newtransaction){
+    Serial.println("<New Transaction>");
+    trandisplay();
+    newtransaction=false;
+  }
+}
+
+
+void trandisplay(){
+  byte hexa1;//=arr[i];
+  byte hexa2;//=arr[i]>>8;
+
+switch (Transaction){
+  case 1:
+    hexa1=0xDFFF;
+    hexa2=0xDFFF>>8;
+    break;
+  case 2:
+    hexa1=0xBBFF;
+    hexa2=0xBBFF>>8;
+    break;
+  case 3:
+    hexa1=0xB77F;
+    hexa2=0xB77F>>8;
+    break;
+  case 4:
+    hexa1=0xB6EF;
+    hexa2=0xB6EF>>8;
+    break;
+  case 5:
+    hexa1=0xB6DD;
+    hexa2=0xB6DD>>8;
+    break;
+   case 6:
+    hexa1=0xB6DA;
+    hexa2=0xB6DA>>8;
+    break;
+  case 7:
+    hexa1=0x6DB7;
+    hexa2=0x6DB7>>8;
+    break;
+   case 8:
+    hexa1=0x7DF7;
+    hexa2=0x7DF7>>8;
+    break;
+  default:
+    hexa1=0xFFFF;
+    hexa2=0xFFFF>>8;
+    break;
+}
+
+  digitalWrite(loadPin, LOW);
+  shiftOut(dataPin, clockPin, LSBFIRST, hexa1);
+  shiftOut(dataPin, clockPin, LSBFIRST, hexa2);
+  digitalWrite(loadPin, HIGH);
+}
