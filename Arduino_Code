@@ -80,10 +80,10 @@ const char WebPage[] =
   "</head>" \
 
   "<body>" \
-  "<p><b>MD_Parola set message</b></p>" \
+  "<p><b>RPA Display Board Message</b></p>" \
 
   "<form id=\"data_form\" name=\"frmText\">" \
-  "<label>Message:<br><input type=\"text\" name=\"Message\" maxlength=\"255\"></label>" \
+  "<label>Message:<br><input type=\"text\" name=\"Message\" maxlength=\"255\"></label><br><br>" \
   "<label>Transaction:<br><input type=\"text\" name=\"Transaction\" maxlength=\"2\"></label>" \
   "<br><br>" \
   "</form>" \
